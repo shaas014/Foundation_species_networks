@@ -1,0 +1,13 @@
+---
+title: ""
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+![](./schema.png)
+
+## Foundation and invasion species networks and communities
+
