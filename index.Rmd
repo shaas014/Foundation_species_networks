@@ -1,6 +1,11 @@
 ---
 title: ""
-output: html_document
+output: 
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: yes
+
 ---
 
 ```{r setup, include=FALSE}
@@ -9,5 +14,305 @@ knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
 
 ![](./schema.png)
 
+##Libraries
+```{r}
+library(tidyverse)
+library(tidygraph)
+library(biclust)
+library(ggraph)
+library(ggpubr)
+library(glmmTMB)
+library(performance)
+library(car)
+library(emmeans)
+library(vegan)
+library(ggrepel)
+```
+
+
 ## Foundation and invasion species networks and communities
 
+```{r}
+#Bring in data
+data <- read_csv("data/tidy_data.csv") %>% unique()
+
+no_data_species <- data %>% group_by(recruit) %>% 
+  summarise(sum = sum(frequency)) %>% 
+  filter(sum == 0) %>% 
+  transform(species = recruit)
+
+data <- data %>% 
+  filter(!(recruit %in% no_data_species)) %>% 
+   mutate(canopy = ifelse(canopy == "open gap", "open", "shrub"))
+
+data_brome <- data %>% 
+  filter(recruit == "Bromus rubens") %>% 
+  group_by(plot_number, canopy) %>% 
+  summarise(brome_site = mean(frequency) > 0) %>% 
+  transform(plot_number = plot_number,
+            canopy = canopy,
+            brome_site = ifelse(brome_site == TRUE, "brome", "no_brome"))
+
+data %>% left_join(data_brome, by = c("plot_number", "canopy")) %>% 
+  group_by(canopy, brome_site) %>%
+  summarise(sites = length(unique(plot_number)))
+
+
+
+#convert to community matrix
+community_matrix <- data %>% 
+  left_join(data_brome, by = c("plot_number", "canopy")) %>% 
+  filter(recruit != "Bromus rubens") %>% 
+  dplyr::select(plot_number, canopy, brome_site, frequency, recruit) %>% 
+  pivot_wider(id_cols = c(plot_number, canopy, brome_site),
+              names_from = recruit,
+              values_from = frequency,
+              values_fn = list(frequency = mean),
+              values_fill = list(frequency = 0)
+              ) %>% 
+  mutate(rowsum = rowSums(dplyr::select(., -plot_number, -canopy, -brome_site)))  %>% 
+  filter(rowsum > 0) %>% 
+  dplyr::select(-rowsum)
+
+```
+
+
+##Network Analysis
+```{r}
+#Node and Edge Lists####
+#Node list is all species with plot_number as the plot_number column
+nodes <- tibble(label = community_matrix %>% dplyr::select(-plot_number, -canopy, -brome_site) %>% colnames()) %>% 
+  rowid_to_column("plot_number")
+
+create_canopy_edge_list <- function(type, br){
+  #remove excess columns from the community dataframe
+  canopy_set <- community_matrix %>% 
+    filter(brome_site == br & canopy == type) %>% 
+    dplyr::select(-plot_number, -brome_site, -canopy) %>% 
+    #manipulate community dataframe so that values are binary and format is a matrix so that matrix multiplication works
+    binarize(threshold = 0.5) %>% 
+    as.matrix()
+  #multiply the transpose of the matrix by itself to result in a count of the number of sites in which two plants occured, or the number of edges between two nodes.
+  adjacency_matrix <- t(canopy_set) %*% canopy_set
+  adjacency_matrix[lower.tri(adjacency_matrix, diag = TRUE)] <- 0
+  canopy_edge_list <- adjacency_matrix %>% 
+    as_tibble() %>% 
+    #create a column with the species names
+    mutate(node1 = colnames(canopy_set)) %>%
+    #change data into a long format or an edge list
+    pivot_longer(cols = -node1,
+                 names_to = "node2",
+                 values_to = "weight") %>% 
+    #identify the edges as occuring in whichever canopy
+    mutate(canopy = type,
+           brome_site = br) %>% 
+    #replace species names with plot_number numbers (reference is in data frame "nodes")
+    left_join(nodes, by = c("node1" = "label")) %>% 
+    rename(from = plot_number) %>% 
+    left_join(nodes, by = c("node2" = "label")) %>% 
+    rename(to = plot_number) %>% 
+    dplyr::select(from, to, weight, canopy, brome_site)
+  #edges with weight 0 do not exist, and edges bewteen the same node will not be mapped here, so replace them with NA and remove rows with NAs.
+  canopy_edge_list$weight[canopy_edge_list$weight == 0] <- NA
+  canopy_edge_list <- na.omit(canopy_edge_list)
+  return(canopy_edge_list)
+}
+
+brome_list <- c("brome", "no_brome")
+edge_list <- lapply(brome_list, function(br){
+  #For each census calculate the edge list for each canopy and use rbind to make a full edge list.
+  #After lapply, result is a list with three components. Each component is an edge list for each census.
+  shrub <- create_canopy_edge_list("shrub", br)
+  open <- create_canopy_edge_list("open", br)
+  
+  edge <- rbind(shrub, open)
+  return(edge)
+})
+
+edge_list <- do.call("rbind", edge_list)
+edge_list
+
+```
+
+```{r}
+#Network Calculations and Centrality####
+#function for calculating netowrk and centrality
+canopy_network <- function(network, type, br) {
+  site_network <- network %>% 
+    activate(edges) %>% 
+    filter(canopy == type & brome_site == br) %>% 
+    activate(nodes) %>% 
+    mutate(
+      central_degree = centrality_degree()
+      )
+}
+
+#Network
+species_network <- tbl_graph(nodes = nodes, edges = edge_list, directed = FALSE) 
+
+species_network_brome <- left_join(species_network, canopy_network(species_network, "shrub", "brome"), by = c("plot_number", "label"), copy = T) %>%
+  left_join(canopy_network(species_network, "open", "brome"), copy = T, by = c("plot_number", "label"), suffix = c(".shrub.brome", ".open.brome"))
+
+species_network_no_brome <- left_join(species_network, canopy_network(species_network, "shrub", "no_brome"), by = c("plot_number", "label"), copy = T) %>%
+  left_join(canopy_network(species_network, "open", "no_brome"), copy = T, by = c("plot_number", "label"), suffix = c(".shrub.no_brome", ".open.no_brome"))
+
+
+species_network_stats <- left_join(species_network_brome, species_network_no_brome, by = c("plot_number", "label"), copy = T)
+species_network_stats
+
+```
+
+```{r}
+#Graphwide Stats Calculation####
+graphwide_stats_canopy <- function(br, type){
+  canopy_stats <- species_network %>% 
+    activate(edges) %>% 
+    filter(canopy == type & brome_site == br) %>% 
+    mutate(
+      diameter = graph_diameter(directed = F),
+      mean_dist = graph_mean_dist(directed = F),
+      size = graph_size(),
+      motif = graph_motif_count()
+      ) %>%
+    as_tibble() %>% 
+    group_by(canopy, brome_site) %>% 
+    summarise(diameter = mean(diameter),
+              size = mean(size),
+              motif = mean(motif)
+              )
+  return(canopy_stats)
+}
+
+graphwide_stats <- lapply(brome_list, function(br){
+  shrub <- graphwide_stats_canopy(br, "shrub")
+  open <- graphwide_stats_canopy(br, "open")
+  return(rbind(shrub, open))
+})
+graphwide_stats <- do.call("rbind", graphwide_stats)
+
+graphwide_stats
+```
+
+```{r}
+#Plot Networks####
+graph_network <- function(br, type){
+  network <- species_network %>%
+    activate(edges) %>% 
+    filter(canopy == type & brome_site == br)
+  ggraph(network, layout = "linear", circular = TRUE) +
+    geom_edge_fan(aes(width = weight), alpha = 0.25) +
+    geom_node_point() +
+    #geom_node_text(aes(label = label, fontface = 3), repel = TRUE, size = 3) +
+    scale_edge_width(guide = "none") + 
+    ggtitle(paste(type, ", ", br)) +
+    theme(plot.title = element_text(face = "bold", size = rel(1), hjust = 0.5),
+             text = element_text(),
+             panel.background = element_rect(colour = NA),
+             plot.background = element_rect(colour = NA),
+            # panel.border = element_rect(colour = "black"),
+             panel.grid.major = element_blank(),
+             panel.grid.minor = element_blank(),
+            # plot.margin=unit(c(10,5,5,5),"mm")
+             strip.background=element_rect(colour="#f0f0f0",fill="#f0f0f0"),
+             strip.text = element_text(face="bold")
+            )
+}
+
+plotlist <- lapply(brome_list, function(br){
+  list(open = graph_network(br, type = "open"),
+  shrub = graph_network(br, type = "shrub"))
+}) %>% 
+  flatten()
+
+
+ggarrange(plotlist = plotlist, ncol = 2, nrow = 2, common.legend = TRUE) +
+  ggsave("network figure.pdf")
+```
+
+
+```{r}
+#Node Centrality####
+node_values <- species_network_stats %>% 
+  activate(nodes) %>% 
+  as_tibble()
+
+node_stats <- node_values %>% 
+  pivot_longer(cols = c(-plot_number, -label),
+               names_to = c("centrality_measure", "canopy", "brome_site"),
+               names_sep = "\\.",
+               values_to = "centrality")
+
+  
+head(node_stats)
+
+
+node_stats %>% group_by(canopy, brome_site, centrality_measure) %>% 
+  summarise(
+    mean_centralilty = mean(centrality),
+    se_centrality = sd(centrality)/sqrt(length(centrality))
+  )
+```
+
+```{r}
+ggplot(subset(node_stats, centrality_measure = "central_degree"), aes(x = brome_site, y = centrality, fill = canopy)) +
+  geom_boxplot() +
+  xlab("Brome Presence") +
+  ylab("Node Degree Centrality") +
+  ylim(0, NA) +
+  theme_classic()
+  #scale_fill_manual(values = c("white", "darkgray")) +
+  #ggsave("Tables and Figures/Figure S7_Degree_Centrality.pdf")
+```
+
+```{r}
+mod_centrality <- glmmTMB(centrality ~ canopy * brome_site + (1|plot_number), data = node_stats, family = "poisson")
+
+check_overdispersion(mod_centrality)
+check_zeroinflation(mod_centrality)
+
+mod_centrality <- glmmTMB(centrality ~ canopy * brome_site + (1|plot_number), data = node_stats, family = "nbinom1")
+
+Anova(mod_centrality, test = "Chisq")
+
+emmeans(mod_centrality, pairwise ~ canopy|brome_site)
+emmeans(mod_centrality, pairwise ~ brome_site|canopy)
+```
+
+##Multivariate Analysis
+```{r}
+#PCoA####
+```
+
+NOTE: The majour species arrows were overscaled and so removed.
+```{r}
+
+pcoa <- capscale((community_matrix %>%  dplyr::select(-brome_site, -plot_number, -canopy)) ~ 1, distance = "bray")
+#these are the species values for arrows
+species <- as_tibble(scores(pcoa)$species, rownames = "species_names")
+species_labels <- subset(species,  MDS2 > 1 | MDS2 < -1)
+#these are the site values for points
+sites <- cbind(as_tibble(scores(pcoa)$sites), canopy = community_matrix$canopy, brome_site = community_matrix$brome_site)
+#plotting it using ggplot
+ggplot() +
+  #plot the points
+  geom_point(data = sites, aes(MDS1, MDS2, shape = canopy, col = brome_site), size = 1.5) +
+  #plot the arrows
+  geom_segment(data = species, aes(x = 0, y = 0, xend = MDS1, yend = MDS2), arrow = arrow(length = unit(0.1, "inches"))) +
+  #plotting the labels so that they are not exactly on the arrows. I also only labelled the larger arrows, hence the subsetting
+  geom_text_repel(data = species_labels, aes(x = MDS1, y = MDS2, fontface = 3, label = gsub("\\."," ", species_names)), size = 5) +
+  #geom_text_repel(data = subset(species, MDS2 > 0.1 | MDS2 < -0.1), aes(community_matrix = MDS1, y = MDS2, fontface = 3), label = gsub("\\."," ", rownames(subset(species, MDS2 > 0.1 | MDS2 < -0.1)))) +
+  xlim(-1.5, 1.5) +
+  ylim(-1.5, 1.5) +
+  labs(x = "PCoA1", y = "PCoA2") +
+  theme_classic() +
+  #theme(text = element_text(size = 18)) +
+  ggsave("PCoA Plot.pdf")
+```
+
+
+```{r}
+#PERMANOVA####
+mod_permanova <- adonis(dplyr::select(community_matrix, -plot_number, -canopy, -brome_site) ~ canopy * brome_site + (1|plot_number), data = community_matrix)
+
+mod_permanova  
+```
